@@ -1,0 +1,878 @@
+---
+title: "PSTAT 131 Final"
+author: "Brianna Mao"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width=10, fig.height=5, echo=FALSE, message=FALSE, warning=FALSE)
+
+library(tidyverse)
+library(dplyr)
+library(maps)
+library(rmarkdown)
+library(gridExtra)
+library(cluster)
+library(tree)
+library(maptree)
+library(glmnet)
+library(ROCR)
+library(randomForest)
+library(e1071)
+
+indent1 = '        '
+```
+
+```{r data setup}
+## read data and convert candidate names and party names from string to factor
+## we manually remove the variable "won", the indicator of county level winner
+## In Problem 5 we will reproduce this variable!
+election.raw <- read_csv("candidates_county.csv", col_names = TRUE) %>% 
+  mutate(candidate = as.factor(candidate), party = as.factor(party), won = NULL)
+
+## remove the word "County" from the county names
+words.to.remove = c("County")
+remove.words <- function(str, words.to.remove){
+  sapply(str, function(str){
+    x <- unlist(strsplit(str, " "))
+    x <- x[!x %in% words.to.remove]
+    return(paste(x, collapse = " "))
+  }, simplify = "array", USE.NAMES = FALSE)
+}
+election.raw$county <- remove.words(election.raw$county, words.to.remove)
+
+## read census data
+census <- read_csv("census_county.csv") 
+```
+
+## Data
+Accurate predictions about election results are highly sought after, and looking at an individual voter's data is one way to predict who may win. 
+
+We use the [county-level 2020 USA presidential election results](https://www.kaggle.com/datasets/unanimad/us-election-2020?select=president_county.csv) by Raphael Fontes and the [2017 United States county-level census data](https://www.kaggle.com/datasets/muonneutrino/us-census-demographic-data) by Muonneutrino to analyze and predict election winners.
+
+<!-- 1. Report the dimension of `election.raw`. Are there missing values in the data set? Compute the total number of distinct values in `state` in `election.raw` to verify that the data contains all states and a federal district. -->
+    ```{r problem 1, eval=FALSE}
+    # dimenstions of the dataset
+    dim(election.raw)
+    
+    # finding missing values
+    filter_all(election.raw, any_vars(is.na(.))) %>% nrow()
+    
+    # computing distinct states (should be 51)
+    length(unique(election.raw$state))
+    ```
+    
+1) The presidential election data, referred to as `election.raw`, consists of 32,177 observations of 5 variables: `state`, `county`, `candidate`, `party`, and `total_votes`. There are no missing values in the data set, and all 50 states and 1 federal district are accounted for.
+    
+<!-- 2. Report the dimension of `census`. Are there missing values in the data set? Compute the total number of distinct values in `county` in `census`. Compare the values of total number of distinct `county` in `census` with that in `election.raw`. Comment on your findings.  -->
+
+    ```{r problem 2, eval=FALSE}
+    # dimensions of the dataset
+    dim(census)
+    
+    # finding missing values
+    filter_all(census, any_vars(is.na(.))) %>% nrow()
+    # only 1 row, see which observation it is
+    filter_all(census, any_vars(is.na(.)))
+    
+    # computing distinct counties
+    group_by(census, State) %>% summarise(count = n_distinct(County)) %>% 
+      summarise(sum(count))
+    # compare to election.raw
+    group_by(election.raw, state) %>% summarise(count = n_distinct(county)) %>%
+      summarise(sum(count))
+    
+    # where are the numbers different?
+    merge(group_by(census, State) %>% 
+            summarise(count.c = n_distinct(County)),
+            group_by(mutate(election.raw, State=state), State) %>% 
+            summarise(count.e = n_distinct(county)),
+          row.names = "State", all.x=TRUE)
+    
+    # why do some of them differ
+    unique(census[census$State == "Connecticut",]$County)
+    unique(election.raw[election.raw$state == "Connecticut",]$county)
+    ```
+    
+2) The 2017 census data, referred to as `census`, consists of 3,220 observations of 37 variables, which include population, ethnicity, income, employment, and more. There is one observation that has missing values (Kalawao County in Hawaii, which is missing data on the percentage of children under the poverty level). 
+
+    There is a total of 3,220 counties in the `census` dataset; however, the `election.raw` dataset has 4,633 counties. Upon further inspection, some of the counties in the `election.raw` dataset are in fact cities, such as Roxbury, Connecticut which is located in Litchfield County. For the sake of this project, these can be ignored.
+
+<!-- 3. Construct aggregated data sets from `election.raw` data: i.e., -->
+<!--     Keep the county-level data as it is in election.raw. -->
+<!--     Create a state-level summary into a election.state. -->
+<!--     Create a federal-level summary into a election.total. -->
+
+3) To make analysis of the data easier, we construct a state-level summary, `election.state`, and a federal-level summary, `election.total`. The first few rows of `election.state` are as follows:
+    
+    ```{r problem 3.1, max.print=5, paged.print = FALSE, rownames.print=FALSE}
+    # state level summary
+    election.state = aggregate(total_votes ~ state + candidate + party, election.raw, FUN = sum)
+    # print first rows
+    paged_table(election.state[order(election.state$state),])
+    ```
+    
+    The first few rows of `election.total` are as follows.
+    
+    ```{r problem 3.2, max.print=5, paged.print = FALSE, rownames.print=FALSE}
+    # federal level summary
+    election.total = aggregate(total_votes ~ candidate + party, election.raw, FUN = sum)
+    # print first rows
+    paged_table(election.total)
+    ```
+
+<!-- 4. How many named presidential candidates were there in the 2020 election? Draw a bar chart of all votes received by each candidate. You can split this into multiple plots or may prefer to plot the results on a log scale. Either way, the results should be clear and legible! (For fun: spot Kanye West among the presidential candidates!) -->
+
+4) There were 38 named presidential candidates total in the 2020 election, and the number of votes each received can be seen below. The votes were plotted on the log scale in order to make visualization easier and does not affect the actual results.
+
+    ```{r problem 4, fig.width=9, fig.height=6, results="hide"}
+    # how many candidates were there
+    length(unique(election.total$candidate))
+    
+    # plot on log scale for visibility
+    election.total = mutate(election.total, log_votes = log(total_votes)
+                            )[order(election.total$total_votes, decreasing = TRUE),]
+    
+    # custom color palette
+    partycols <- c("DEM" = "blue", "REP"="red", "LIB" = "gold", "GRN" = "green",
+      "WRI" = "white", "ALI" = "#EB001F", "PSL" = "red2", "IND" = "purple",
+      "CST" = "purple3", "ASP" = "orange", "NON" = "lightgray", "SWP" = "maroon",
+      "UTY" = "light blue", "BAR" = "peachpuff", "PRG" = "tomato", "PRO" = "pink",
+      "UNA" = "darkgray", "LLP" = "olivedrab1", "GOP" = "darkgreen", "IAP" = "mediumpurple3",
+      "LLC" = "brown", "OTH" = "black", "APV" = "yellow", "SEP" = "orangered",
+      "BFP" = "spring green", "BMP" = "violetred")
+    
+    # plot barplot
+    ggplot(election.total, aes(x = log_votes, y = reorder(candidate, log_votes))) +
+      geom_bar(stat = "identity", aes(fill = party)) +
+      labs(title = "Total Votes per Candidate", fill="Political Party", 
+           x = "Total Votes (Transformed on log)", y = "Candidate") + 
+      theme(axis.text.y = element_text(size = 6)) +
+      scale_fill_manual(values = partycols) 
+    ```
+
+<!-- 5. Create data sets county.winner and state.winner by taking the candidate with the highest proportion of votes in both county level and state level. Hint: to create county.winner, start with election.raw, group by county, compute total votes, and pct = votes/total as the proportion of votes. Then choose the highest row using top_n (variable state.winner is similar). -->
+
+5) The winner in each county is saved in the dataset `county.winner` and the winner in each state is saved in the dataset `state.winner`. The first few rows of `county.winner` are as follows:
+
+    ```{r problem 5.1, max.print=5, rownames.print=FALSE}
+    # county winner
+    county.winner = election.raw %>% group_by(state, county) %>% 
+      mutate(total = sum(total_votes), pct = total_votes/sum(total_votes)) %>% top_n(1)
+    # print first rows
+    paged_table(county.winner)
+    ```
+    
+    The first few rows of `state.winner` are as follows:
+    
+    ```{r problem 5.2, max.print=5, rownames.print=FALSE}
+    # state winner
+    state.winner = election.state %>% group_by(state) %>% 
+      mutate(total = sum(total_votes), pct = total_votes/sum(total_votes)) %>% top_n(1)
+    # print first rows
+    paged_table(state.winner)
+    ```
+
+## Visualization
+Using maps is an easy way to show results in a simple manner. For example, a list of 3,000 counties can instead be shown as a single visual:
+
+<!-- 6. Use similar code to draw county-level map by creating counties = map_data("county"). Color by county.  -->
+6)
+    ```{r problem 6}
+    # given from problem
+    states <- map_data("state")
+    
+    # ggplot(data = states) + 
+    #   geom_polygon(aes(x = long, y = lat, fill = region, group = group),
+    #                color = "white") + 
+    #   coord_fixed(1.3) +
+    #   guides(fill=FALSE)  # color legend is unnecessary and takes too long
+    
+    # replicate for counties
+    counties <- map_data("county")
+    
+    ggplot(data = counties) + 
+      geom_polygon(aes(x = long, y = lat, fill = subregion, group = group),
+                   color = "white", size = 0.1) + 
+      coord_fixed(1.3) + labs(title = "Counties in the USA", x = "Longitude", y = "Latitude") + 
+      guides(fill=FALSE)
+    ```
+
+Likewise, the winner of the election in each state can be plotted onto a map of all 50 states:
+
+<!-- 7. Now color the map by the winning candidate for each state. First, combine states variable and state.winner we created earlier using left_join(). Note that left_join() needs to match up values of states to join the tables. A call to left_join() takes all the values from the first table and looks for matches in the second table. If it finds a match, it adds the data from the second table; if not, it adds missing values. Here, we’ll be combing the two data sets based on state name. However, the state names in states and state.winner can be in different formats: check them! Before using left_join(), use certain transform to make sure the state names in the two data sets: states (for map drawing) and state.winner (for coloring) are in the same formats. Then left_join(). Your figure will look similar to New York Times map. -->
+
+7)
+    ```{r problem 7}
+    # turn state into the same format
+    states = mutate(states, state = str_to_title(region))
+    
+    # join with winner data
+    statemap = left_join(states, state.winner)
+    
+    # plot
+    us.winner = ggplot(data = statemap) + 
+      geom_polygon(aes(x = long, y = lat, fill = candidate, group = group),
+                   color = "white", linewidth = 0.001) + 
+      coord_fixed(1.3) + labs(title = "Election Results",
+                              x = "Longitude", y = "Latitiude", fill = "Winner") 
+    us.winner
+    ```
+
+And the winner of the election in each county for a state can be plotted onto a map of the state:
+
+<!-- 8. Color the map of the state of California by the winning candidate for each county. -->
+8)
+    ```{r problem 8}
+    # filter only for CA counties and convert states to same formate and merge
+    camap = filter(counties, region=="california") %>% 
+      mutate(state = str_to_title(region), county = str_to_title(subregion)) %>% 
+      left_join(county.winner)
+    
+    # plot
+    ca.winner = ggplot(data = camap) + 
+      geom_polygon(aes(x = long, y = lat, fill = candidate, group = group),
+                   color = "white", linewidth = 0.1) + 
+      coord_fixed(1.3) + labs(title = "Election Results in California", 
+                              x = "Longitude", y = "Latitiude", fill = "Winner") 
+    ca.winner
+    ```
+
+<!-- 9. (Open-ended) Create a visualization of your choice using census data. Many exit polls noted that demographics played a big role in the election. Use this Washington Post article and this R graph gallery for ideas and inspiration. -->
+9) Demographics seem to play a role in which candidate voters choose. In particular, people often look at a voter's race or income level when predicting which candidate a voter would vote for, as there are certain preconceptions regarding one's race or income and their associated political party in the US. We can visualize these demographics as well by plotting the statistics for each county on a map by state:
+    ```{r problem 9.1, fig.width=12}
+    # merge with census data
+    povmapca = left_join(camap, mutate(census, county = remove.words(census$County, "County")))
+    povmapfull = left_join(mutate(counties, county = str_to_title((subregion))), 
+                           mutate(census, county = remove.words(census$County, "County")))
+    
+    # plot poverty in California per county
+    povertyca = ggplot(data = povmapca) +
+      geom_polygon(aes(x = long, y = lat, fill = Poverty, group = group),
+                   color = "white", size = 0.1) +
+      coord_fixed(1.3) + labs(title = "Poverty Levels per County",
+                              x = "Longitude", y = "Latitiude", fill = "% Under Poverty Level") +
+      scale_fill_continuous(low = "darkgreen", high = "palegreen")
+    
+    # compare to election results in CA
+    grid.arrange(ca.winner, povertyca, ncol=2)
+
+    ```
+    
+    Or overall:
+    
+    ```{r problem 9.2,fig.height=10}
+    # plot number of white people in US per county
+    whiteus = ggplot(data = povmapfull) +
+      geom_polygon(aes(x = long, y = lat, fill = White, group = group),
+                   color = "black", size = 0.0001) +
+      coord_fixed(1.3) + labs(title = "Percentage of White People per County",
+                              x = "Longitude", y = "Latitiude", fill = "Percentage") +
+       scale_fill_viridis_c()
+    
+    # compare to election results
+    grid.arrange(us.winner, whiteus, ncol=1)
+    ```
+
+<!-- 10. The census data contains county-level census information. In this problem, we clean and aggregate the information as follows. -->
+
+<!--     Clean county-level census data census.clean: start with census, filter out any rows with missing values, convert {Men, Employed, VotingAgeCitizen} attributes to percentages, compute Minority attribute by combining {Hispanic, Black, Native, Asian, Pacific}, remove these variables after creating Minority, remove {IncomeErr, IncomePerCap, IncomePerCapErr, Walk, PublicWork, Construction}. -->
+<!--     Many columns are perfectly colineared, in which case one column should be deleted. -->
+
+<!--     Print the first 5 rows of census.clean: -->
+
+10) We still have many variables in the `census` dataset, not all of which may be important to include. We reduce the number of variables and save this as a new dataset, `census.clean`, by removing some variables that have high correlation with each other. The first 5 rows of `census.clean` are shown below:
+    ```{r problem 10, layout="l-body-outset"}
+    census.clean = census %>% na.omit() %>%                      ## remove NA rows
+      mutate(Men = Men/TotalPop,                                 ## change to percentage 
+             Employed = Employed/TotalPop,                       ## change to percentage
+             VotingAgeCitizen = VotingAgeCitizen/TotalPop,       ## change to percentage
+             Minority = Hispanic + Black + Native + Asian + Pacific) %>%# merge Minority
+      subset(select = -c(Hispanic, Black, Native, Asian, Pacific, ## remove minority data
+                         IncomeErr, IncomePerCap, IncomePerCapErr, 
+                         Walk, PublicWork, Construction))        ## remove specified variables
+    
+    # see which variables have high correlation. consider correlations > 0.8
+    # round(cor(census.clean[,-c(1:3)]), 4)
+    # Women & TotalPop (0.9999), Minority & White (-0.9973), ChildPoverty & Poverty (0.9382)
+    
+    # remove from census.clean
+    census.clean = subset(census.clean, select = (-c(Women, Minority, ChildPoverty)))
+    
+    paged_table(head(census.clean, 5))
+    ```
+
+## Clustering
+Even after reduction, there are still quite some variables left in `census.clean`. We can perform Principal Component Analysis (PCA), which further reduces the dimensions of the data by finding principal components that are linear combinations of the original features.
+
+<!-- 11. Run PCA for the cleaned county level census data (with State and County excluded). Save the first two principal components PC1 and PC2 into a two-column data frame, call it pc.county. Discuss whether you chose to center and scale the features before running PCA and the reasons for your choice. What are the three features with the largest absolute values of the first principal component? Which features have opposite signs and what does that mean about the correlation between these features? -->
+
+    ```{r problem 11, results="hide"}
+    # perform PCA
+    pca.census = prcomp(census.clean[,-c(2,3)], scale=TRUE)
+    
+    # make pc.county
+    pc.county = data.frame(PC1 = pca.census$x[,1],
+                           PC2 = pca.census$x[,2])
+    
+    # find first 3 values with largest abs value in 1st PC
+    head(sort(abs(pca.census$rotation[,1]), decreasing = TRUE), 3)
+    pca.census$rotation[,1]
+    ```
+
+11) PCA requires the data to be centered because the process requires each column of the data to have a mean of 0, which can be obtained by centering. We also scale the data because the features in the `census.clean` dataset are recorded on different scales (ie. `Men` is recorded in percent, `Income` is recorded in dollars). 
+
+    In the first principal component, `Employed`, `Poverty`, `Income` have the largest absolute values of the first principal component.
+    
+    `TotalPop`, `Men`, `White`, `Income`, `Professional`, `Transit`, `OtherTransp`, `WorkAtHome`, `Employed`, `PrivateWork`, `SelfEmployed`, and `FamilyWork` have negative signs while `VotingAgeCitizen`, `Poverty`, `Service`, `Office`, `Production`, `Drive`, `Carpool`, `MeanCommute` and `Unemployment` have positive signs. Opposite signs between features indicate that the features have 0 correlation.
+
+When performing PCA, some of the data in the first few principal components are lost in dimension reduction. To calculate how much of this information is lost, we can calculate the proportion of variance explained (PVE) for each principal component, which tells us how much variance each PC explains. 
+
+<!-- 12. Determine the number of minimum number of PCs needed to capture 90% of the variance for the analysis. Plot proportion of variance explained (PVE) and cumulative PVE. -->
+
+12) To calculate how many principal components are needed to capture a certain amount of the variance in the data, we can plot the cumulative proportion of variance explained (CPVE) and find where the number of PCs intercepts that threshold. Based on the plot below, we need a minimum of 13 PCs to capture 90% of the variance for analysis.
+
+    ```{r problem 12}
+    # calculate pve and cpve
+    pvedf <- data.frame(pve = (pca.census$sdev^2) / sum(pca.census$sdev^2),
+                        cpve = cumsum((pca.census$sdev^2) / sum(pca.census$sdev^2)))
+        
+    # plot pve
+    pveplot <- ggplot(pvedf, aes(x=as.numeric(row.names(pvedf)), y=pve)) +
+      geom_line() + geom_point(size = 2, color = "red") + 
+      labs(x = "Principal Component", y = "PVE")
+    
+    # plot cpve
+    cpveplot <- ggplot(pvedf, aes(x=as.numeric(row.names(pvedf)), y=cpve)) +
+      geom_line() + geom_point(size = 2, color = "blue") + 
+      labs(x = "Principal Component", y = "Cumulative PVE")
+    
+    # plot both
+    grid.arrange(pveplot, cpveplot, ncol = 2)
+    ```
+    ```{r problem 12.2, results="hide"}
+    # which pc is min to get 90% of variance explained
+    head(pvedf[pvedf$cpve > 0.9, ,], 1)
+    ```
+
+Another method of variable reduction is hierarchical clustering, which groups observations together into clusters. 
+
+<!-- 13. With census.clean (with State and County excluded), perform hierarchical clustering with complete linkage. Cut the tree to partition the observations into 10 clusters. Re-run the hierarchical clustering algorithm using the first 2 principal components from pc.county as inputs instead of the original features. Compare the results and comment on your observations. For both approaches investigate the cluster that contains Santa Barbara County. Which approach seemed to put Santa Barbara County in a more appropriate clusters? Comment on what you observe and discuss possible explanations for these observations. -->
+
+13) We perform hierarchical clustering on `census.clean` to split the data into 10 clusters. We also perform hierarchical clustering on the first two principal components we obtained previously and split that into 10 clusters. The number of observations in each cluster can be seen as follows:
+
+    ```{r problem 13.1, fig.height=14}
+    set.seed(123)
+    
+    # cluster on census.clean and cut
+    complete.clust = hclust(dist(census.clean))
+    census.clean.clustering = cutree(complete.clust, 10)
+    
+    # cluster on PCs and cut
+    pc.clus = hclust(dist(pc.county))
+    pc.clustering = cutree(pc.clus, 10)
+    
+    # compare how many obs are in each cluster for both
+    table(census.clean.clustering)
+    table(pc.clustering)
+    ```
+    
+    Hierarchical clustering on `census.clean` sees most data falling into cluster 1 and much fewer observations in each of the other clusters, some of them with frequencies merely in the single digits. Clustering on the principal components also sees more observations in cluster 1, but in comparison, the number of observations in each cluster are more balanced, as more clusters have observations in the triple digits.
+    
+    We can observe the datapoint Santa Barbara County to see which method provides the better cluster. We calculate the average statistics for the cluster that contains Santa Barbara County while excluding Santa Barbara County for both methods of clustering, then compare those averages with the data for Santa Barbara County. Hierarchical clustering on `census.clean` seemed to put Santa Barbara County in the most appropriate cluster, because more of the averages align with the data seen in Santa Barbara County. This may be because clustering performed on the first two principal components do not capture a lot of variability in the data, and thus are not as accurate compared to clustering on `census.clean`, which contains all of the original data.
+  
+    ```{r problem 13.2}
+    # put cluster assignments with census data
+    census.clust = cbind(clus = census.clean.clustering, census.clean)
+    census.pclust = cbind(clus = pc.clustering, census.clean)
+    
+    # calculate average stats for the cluster with SB county while excluding SB county
+    compclus2 = (round(colMeans(census.clust[census.clust$County != "Santa Barbara County" &
+                                  census.clust$clus == 2, -c(2:4)]), 2))
+    pcclus2 = (round(colMeans(census.pclust[census.pclust$County != "Santa Barbara County" &
+                                  census.pclust$clus == 2, -c(2:4)]), 2))
+    
+    # Santa Barbara County data
+    sbdat = census.clust[census.clust$County == "Santa Barbara County", -c(1:4)]
+    
+    # cluster data w/o Santa Barbara
+    clust2comp = data.frame(t(cbind(compclus2[-1], pcclus2[-1])))
+    # make sure can combine later
+    colnames(clust2comp) = colnames(sbdat)
+    
+    # combine for ease of comparison
+    sbcomp = rbind(sbdat, clust2comp)
+    rownames(sbcomp) = c("Santa Barbara County", "census.clean Clustering", "PC Clustering")
+    paged_table(sbcomp)
+    ```
+
+## Classification
+By combining the election results data and the census data, we can create a dataset that contains both demographics and election winners in each county, which can be used to predict election winners under different models.
+
+<!-- 14. Understand the code. Why do we need to exclude the predictor party from election.cl?  -->
+
+14) When creating this dataset, `election.cl`, we drop all other predictor variables that are not numeric variables, such as `party`, because we are only interested in predicting the election winner `Candidate` using the demographic data. `party` is a qualitative variable, thus cannot be used to perform calculations involving mathematical operations. The first few rows of `election.cl` are shown below:
+
+    ```{r problem 14, max.print = 5}
+    # we move all state and county names into lower-case
+    tmpwinner <- county.winner %>% ungroup %>%
+      mutate_at(vars(state, county), tolower)
+    
+    # we move all state and county names into lower-case
+    # we further remove suffixes of "county" and "parish"
+    tmpcensus <- census.clean %>% mutate_at(vars(State, County), tolower) %>%
+      mutate(County = gsub(" county|  parish", "", County)) 
+    
+    # we join the two datasets
+    election.cl <- tmpwinner %>%
+      left_join(tmpcensus, by = c("state"="State", "county"="County")) %>% 
+      na.omit
+    
+    # drop levels of county winners if you haven't done so in previous parts
+    election.cl$candidate <- droplevels(election.cl$candidate)
+    
+    ## save meta information
+    election.meta <- election.cl %>% select(c(county, party, CountyId, state, total_votes, pct, total))
+    
+    ## save predictors and class labels
+    election.cl = election.cl %>% select(-c(county, party, CountyId, state, total_votes, pct, total))
+    
+    paged_table(election.cl)
+    ```
+
+    
+```{r test and training}
+set.seed(10) 
+n <- nrow(election.cl)
+idx.tr <- sample.int(n, 0.8*n) 
+election.tr <- election.cl[idx.tr, ]
+election.te <- election.cl[-idx.tr, ]
+```
+
+```{r cv setup}
+set.seed(20) 
+nfold <- 10
+folds <- sample(cut(1:nrow(election.tr), breaks=nfold, labels=FALSE))
+
+calc_error_rate = function(predicted.value, true.value){
+  return(mean(true.value!=predicted.value))
+}
+records = matrix(NA, nrow=3, ncol=2)
+colnames(records) = c("train.error","test.error")
+rownames(records) = c("tree","logistic","lasso")
+```
+
+<!-- 15. Decision tree: train a decision tree by cv.tree().  Prune tree to minimize misclassification error. Be sure to use the folds from above for cross-validation.  Visualize the trees before and after pruning. Save training and test errors to records object.  Interpret and discuss the results of the decision tree analysis.  Use this plot to tell a story about voting behavior. -->
+
+15) A decision tree is a simple way to visualize and understand how predictors lead to a classification. However, they often do not have good accuracy, and when they are large, the tree tends to overfit the data. Thus, a tree is pruned to a size determined through cross-validation, and a large tree ... 
+
+    ```{r problem 15}
+    set.seed(123)
+    # make a tree
+    election.tree = tree(candidate ~ ., data = election.tr)
+
+    # use CV to prune tree
+    election.tree.cv <- cv.tree(election.tree, FUN=prune.misclass, rand=folds)
+    election.tree.bestcv <- min(election.tree.cv$size[election.tree.cv$dev == min(election.tree.cv$dev)])
+    
+    # problem: pruned tree will look the same as original tree() already returned best size of 11
+    # for the sake of answering the visualization process, will make a purposefully large tree then show the "pruned"
+    
+    example.tree = tree(candidate ~ ., data = election.tr, 
+                        control = tree.control(nrow(election.tr), 5, 10, 0.006))
+    draw.tree(example.tree, nodeinfo = TRUE, cex = 0.35)
+    ```
+    
+    will now look much smaller:
+    
+    ```{r problem 15.2}
+    set.seed(123)
+    # prune and plot tree using best cv value (will be the same in this problem)
+    pruned.tree <- prune.misclass(election.tree, best = election.tree.bestcv)
+    draw.tree(pruned.tree, nodeinfo=TRUE, cex = 0.6)
+    
+    # calculate training error rate and save
+    tree.trainerr = predict(pruned.tree, election.tr, type="class")
+    records[1,1] = calc_error_rate(tree.trainerr, election.tr$candidate)
+    
+    # calculate test error rate and save
+    tree.testerr = predict(pruned.tree, election.te, type="class")
+    records[1,2] = calc_error_rate(tree.testerr, election.te$candidate)
+    ```
+    
+    The decision tree is split on the variables `Transit` (the percentage of the population that commutes using public transportation), `White`, `Income`, `Office`, `Production`, and `TotalPop`. Based on this tree, areas that use lots of public transportation, have a population above 131,000, and have have more than 20% of residents being non-white will vote for Joe Biden (node 11), and areas without lots of public transportation and are mostly white will vote for Donald Trump (nodes 4 to 7). Similar interpretations can be made for all of the other nodes of the tree.
+
+<!-- 16. Run a logistic regression to predict the winning candidate in each county. Save training and test errors to records variable. What are the significant variables? Are they consistent with what you saw in decision tree analysis?  Interpret the meaning of a couple of the significant coefficients in terms of a unit change in the variables. -->
+
+16) Logistic regression is another method used to fit models in a classification problem by calculating the log(odds) of a binary response, in this case Donald Trump or Joe Biden. The summary of a logistic regression fitted on the data is shown below: 
+
+    ```{r problem 16}
+    # fit a logistic regression
+    election.log = glm(candidate ~ ., data=election.tr, family="binomial")
+    
+    # calculate training error and save
+    log.trainerr = as.factor(ifelse(predict(election.log, election.tr, type="response")<=0.5, 
+                                             "Donald Trump", "Joe Biden"))
+    records[2,1] = calc_error_rate(log.trainerr, election.tr$candidate)
+    
+    # calculate test error and save
+    log.testerr = as.factor(ifelse(predict(election.log, election.te, type="response")<=0.5, 
+                                             "Donald Trump", "Joe Biden"))
+    records[2,2] = calc_error_rate(log.testerr, election.te$candidate)
+    
+    # significant variables
+    summary(election.log)
+    ```
+    After fitting a logistic regression model to the data, we find that extremely significant variables include `White`, `VotingAgeCitizen`, `Professional`, `Service`, `Production`, `Employed`, and `Unemployment`. This is not consistent with the decision tree because only the variables `White` and `Production` are considered significant in both models.
+
+    The coefficients in a logistic regression models can be interpreted easily. For example, the `White` coefficient -0.1264 indicates for every 10% increase in the percentage of the population in a county that is white, the log(odds) of Joe Biden winning that county decreases by -1.264 (or conversely, the log(odds) of Donald Trump winning the county increases by 1.264), conditional on all other predictors. The `Employed` coefficient of 26.43 indicates that for every 1% increase in the percentage of the population in a county that is employed, the log(odds) of Joe Biden winning that county increases by 26.43, conditional on all other predictors.
+
+<!-- 17. You may notice that you get a warning glm.fit: fitted probabilities numerically 0 or 1 occurred. As we discussed in class, this is an indication that we have perfect separation (some linear combination of variables perfectly predicts the winner). This is usually a sign that we are overfitting. One way to control overfitting in logistic regression is through regularization. -->
+
+<!--  Use the cv.glmnet function from the glmnet library to run a 10-fold cross validation and select the best regularization parameter for the logistic regression with LASSO penalty. Set lambda = seq(1, 50) * 1e-4 in cv.glmnet() function to set pre-defined candidate values for the tuning parameter λ. What is the optimal value of λ in cross validation? What are the non-zero coefficients in the LASSO regression for the optimal value of λ? How do they compare to the unpenalized logistic regression? Comment on the comparison. Save training and test errors to the records variable. -->
+
+17) In our logistic regression model, we receive a warning that we are overfitting the data. One way to combat this is to perform variable selection through LASSO regression. Through cross-validation, we determine the optimal size for the tuning parameter $\lambda$ is 0.0004. The resulting model sets some coefficients to 0, shown below:
+
+    ```{r problem 17}
+    set.seed(123)
+    
+    # find the best lambda value through CV
+    lasso.lamda = cv.glmnet(as.matrix(election.tr[,-1]), 
+                           ifelse(election.tr$candidate=="Donald Trump", 0 ,1), 
+                           alpha=1, lambda = seq(1, 50) * 1e-4, nfolds=10)
+    lasso.best = lasso.lamda$lambda.min
+    
+    # lasso.best = 4e-04 = 0.0004
+    
+    # fit the LASSO regression model using best lambda
+    election.lasso <- glmnet(as.matrix(election.tr[,-1]), 
+                             ifelse(election.tr$candidate=="Donald Trump", 0 ,1),
+                             alpha=1, lambda=lasso.best)
+    
+    # which coefficients are now 0
+    round(coef(election.lasso)[,1], 4)
+    
+    # calculate training error and save
+    lasso.trainerr = as.factor(ifelse(predict(election.lasso, 
+                                              as.matrix(election.tr[,-1]), type="response")<=0.5, 
+                                             "Donald Trump", "Joe Biden"))
+    records[3,1] = calc_error_rate(lasso.trainerr, election.tr$candidate)
+    
+    # calculate test error and save
+    lasso.testerr = as.factor(ifelse(predict(election.lasso, 
+                                           as.matrix(election.te[,-1]), type="response")<=0.5, 
+                                             "Donald Trump", "Joe Biden"))
+    records[3,2] = calc_error_rate(lasso.testerr, election.te$candidate)
+    ```
+
+    The model leaves us with the variables `White`, `VotingAgeCitizen`, `Poverty`, `Professional`, `Service`, `Office`, `Production`, `Drive`, `Carpool`, `Transit`, `OtherTransp`, `WorkAtHome`, `MeanCommute`, `Employed`, `PrivateWork`, `SelfEmployed`, `FamilyWork`, and `Unemployment`. 
+
+    The LASSO regression model considers many variables that the logisitc regression model does not consider significant, such as `Poverty`, `Carpool`, `OtherTransp`, `WorkAtHome`, `MeanCommute`, `SelfEmployed` and `FamilyWork`. Even so, both models find `White`, `VotingAgeCitizen`, `Professional`, `Service`, `Office`, `Production`, `Drive`, `Transit`, `Employed`, `PrivateWork`, and `Unemployment` are significant variables. 
+
+<!-- 18. Compute ROC curves for the decision tree, logistic regression and LASSO logistic regression using predictions on the test data. Display them on the same plot. Based on your classification results, discuss the pros and cons of the various methods. Are the different classifiers more appropriate for answering different kinds of questions about the election? -->
+
+18) Model performance can be visualized by an ROC plot, which displays the true positive rate and the false positive rate for a model. Models with a better overall performance have an area under the curve closer to 1. The ROC plot for our decision tree, logistic regression model, and LASSO regression model is shown below:
+    
+    ```{r problem 18}
+    # make predictions for each model
+    tree.pred = prediction(predict(election.tree, election.te, type="vector")[, 2],
+                           election.te$candidate)
+    log.pred = prediction(predict(election.log, election.te, type="response"),
+                          election.te$candidate)
+    lasso.pred = prediction(predict(election.lasso, as.matrix(election.te[,-1]), type="response"),
+                            election.te$candidate)
+    
+    # manually obtain tpr and fpr
+    tree.tpr = performance(tree.pred, "tpr")@y.values[[1]]
+    tree.fpr = performance(tree.pred, "fpr")@y.values[[1]]
+    log.tpr = performance(log.pred, "tpr")@y.values[[1]]
+    log.fpr = performance(log.pred, "fpr")@y.values[[1]]
+    lasso.tpr = performance(lasso.pred, "tpr")@y.values[[1]]
+    lasso.fpr = performance(lasso.pred, "fpr")@y.values[[1]]
+    
+    # plot on same graph
+    plot(tree.fpr, tree.tpr, type="l", col="green", lwd=3, 
+         main="ROC Curve", xlab = "False Positive Rate", ylab = "True Positive Rate")
+    lines(log.fpr, log.tpr, col="red", lwd=3)
+    lines(lasso.fpr, lasso.tpr, col="blue", lwd=3)
+    legend(0.7, 0.3,
+           legend=c("Decision Tree", "Logisitic Regression", "LASSO Logistic Regression"),
+           col = c("green", "red", "blue"), lty=1)
+    ```
+
+    The graph shows that the logistic regression model seems to have the best performance of the three models. This is supported by the test error rates for the three fitted models:
+    
+    ```{r problem 18.2, paged.print = FALSE}
+    paged_table(data.frame(records))
+    ```
+    
+    The logistic regression model has a test error rate of 0.0615, lower than the decision tree test error rate of 0.0922 and the LASSO regression test error rate of 0.0696. 
+    
+    Decision trees are simpler to visualize and understand, but are often very inaccurate. Logistic regression provides a linear model for binary classification, which is easy to interpret and infer, but in this case uses many variables, which causes overfitting and may not actually fit new data accurately. LASSO regularization can perform variable selection and potentially reduce variance by increasing bias. However, the interpretation of the coefficients in logistic regression and LASSO regularization on a logistic model must be in terms of the log(odds) of the response, which may be harder for casual observers to comprehend. Logistic regression and LASSO logistic regression are both linear models which may not work well when the true data is more flexible, whereas decision trees can handle this flexibility. 
+    
+    These models can help tackle different questions regarding this dataset. LASSO regularization can be used to answer which variables are more important in determining the results of the election in a model. Logistic regression can shed insight on how each variable affects the results. 
+
+## Extensions
+
+<!-- 19. Explore additional classification methods. Consider applying additional two classification methods from KNN, LDA, QDA, SVM, random forest, boosting, neural networks etc. (You may research and use methods beyond those covered in this course). How do these compare to the tree method, logistic regression, and the lasso logistic regression? -->
+
+19) A single decision tree can have low predictive accuracy, but multiple trees together can improve prediction accuracy by lowering the variance. 
+
+    ```{r problem 19.1, results="hide", fig.show="hide"}
+    set.seed(123)
+    
+    # fit a random forest, mtry = sqrt(p) by default in classification
+    election.forest = randomForest(candidate ~ ., data = election.tr,
+                 importance=TRUE)
+    election.forest
+    
+    # calculate training and test error
+    forest.trainerr = predict(election.forest, election.tr)
+    forest.testerr = predict(election.forest, election.te)
+    records = rbind(records, randForest = c(calc_error_rate(forest.trainerr, election.tr$candidate),
+                                            calc_error_rate(forest.testerr, election.te$candidate)))
+    
+    # which variables did the random forest consider important
+    varImpPlot(election.forest, sort=T, n.var = 3)
+    ```
+    We fit a random forest model and find that the out-of-bag error estimate is 0.0676 and the test error rate is 0.0647. The random forest considers `White`, `Transit`, and `TotalPop` to be the 3 most significant variables, which is similar to the variables chosen in the decision tree. 
+    
+    We can also use a support vector machine to perform classification. A support vector machine divides predictions with a hyperplane so that the data is mostly separated, with some allowance in the margins or even on the wrong side of the hyperplane.
+
+    ```{r problem 19.2, cache=TRUE, results="hide"}
+    set.seed(123)
+
+    # fit a SVM
+    election.svm = svm(candidate ~ ., data = election.tr, kernel="polynomial", cost = 10, scale = TRUE)
+
+    costgrid = seq(0, 1, by = 0.01)
+
+    # tune using cross validation
+    election.svmtune = tune(svm, candidate ~ ., data=election.tr, kernel="polynomial",
+                            ranges=list(cost=costgrid[-1]))
+
+    # choose best model
+    election.svmbest = election.svmtune$best.model
+
+    # calc training and test error rate
+    svm.trainerr = predict(election.svmbest, election.tr)
+    svm.testerr = predict(election.svmbest, election.te)
+    records = rbind(records, svm = c(calc_error_rate(svm.trainerr, election.tr$candidate),
+                                     calc_error_rate(svm.testerr, election.te$candidate)))
+    ```
+    
+    We fit a support vector machine with a polynomial kernel so that it is more flexible than linear-based models and calculate the test error rate. The training and test error rates for all five models are as follows:
+    
+    ```{r problem 19.3, paged.print = FALSE}
+    paged_table(data.frame(records))
+    ```
+
+    The logistic regression model still provides the lowest test error rate of these five models. The random forest and support vector machine provide better prediction accuracy than a decision tree, but are also harder to interpret compared to the linear-based models like logistic regression and LASSO regularized logistic regression.
+
+<!-- 20. Tackle at least one more interesting question. Creative and thoughtful analysis will be rewarded! Some possibilities for further exploration are: -->
+
+<!--     Explore using census data to predict mid-term election results. For this purpose, feel free to search for the mid-term election dataset, and make any necessary references. -->
+
+<!--     Consider a regression problem! Use linear regression models to predict the total votes for each candidate by county. Compare and contrast these results with the classification models. Which do you prefer and why? How might they complement one another? -->
+
+<!--     Conduct an exploratory analysis of the “purple” counties – the “battle ground” / “swing counties”: which the models predict Biden and Trump were roughly equally likely to win. What is it about these counties that make them hard to predict? -->
+
+<!--     Instead of using the native attributes (the original features), we can use principal components to create new (and lower dimensional) set of features with which to train a classification model. This sometimes improves classification performance. Compare classifiers trained on the original features with those trained on PCA features. -->
+
+20) The votes from "swing counties" can influence the results of the elections. Both candidates are almost equally likely to win in those counties, which can make them highly contested targets of campaigns and ads. We consider swing counties as counties where the winning candidate won only 47% to 53% of the toal votes in the county. Based on the 2020 election results, there were 599 actual swing counties, shown below in purple:
+
+    ```{r problem 20}
+    # how many are there?
+    # length(county.winner[between(county.winner$pct, 0.47, 0.53),]$county)
+    
+    map20 = left_join(mutate(counties, county = str_to_title((subregion))), county.winner)
+    
+    # if won by 47% - 53% of total votes in county, consider that as swing county
+    map20$candidate = as.character(map20$candidate)
+    map20$candidate[between(map20$pct, 0.47, 0.53) == TRUE] = "Swing"
+    
+    ggplot(data = map20) + 
+      geom_polygon(aes(x = long, y = lat, fill = as.factor(candidate), group = group),
+                   color = "white", size = 0.0001) + 
+      coord_fixed(1.3) + labs(title = "Location of Swing Counties", x = "Longitude", y = "Latitude", fill = "Winner") + 
+      guides(fill=FALSE) +
+      scale_fill_manual(values = c("Donald Trump" = "#7F7F7F", "Joe Biden" =  "#7F7F7F", "Swing" = "purple"))
+    ```
+
+    We use the logistic regression model and predict which counties will be swing counties. The logistic regression model predicted 29 counties would be swing counties, and the error rate for predicted winners for those counties is 0.5517. The location of correct predictions are shown below in green and incorrect predictions in red:
+
+    ```{r problem 20.2}
+    set.seed(123)
+    # predict probabilites of winning on all counties
+    all.pred = predict(election.log, election.cl, type="response")
+    
+    # combine with all county data
+    election.20 = cbind(all.pred, election.meta[,c(1,3,4)], election.cl[,1])
+    election.20copy = election.20
+    
+    # change candidate to Swing if predicted prob between 47% and 53%
+    election.20$candidate = as.character(election.20$candidate)
+    election.20[between(election.20$all.pred, 0.47, 0.53), ]$candidate = "Swing"
+
+    # select only counties predicted to be swing and find predicted winner
+    election.swing = subset(election.20, election.20$candidate=="Swing") %>%
+      mutate(pred.winner = as.factor(ifelse(all.pred <= 0.5, "Donald Trump", "Joe Biden")))
+    # how many are there?
+    # length(election.swing$county)
+    
+    # calculate error rate
+    swing.err.log = calc_error_rate(election.swing$pred.winner,
+                                election.20copy[between(election.20copy$all.pred, 0.47, 0.53), ]$candidate)
+    
+    # plot on map
+    swing.tf =  election.20 %>% 
+      mutate(pred.winner = ifelse(candidate == "Swing", 
+                                  ifelse(all.pred <= 0.5, "Donald Trump", "Joe Biden"), candidate)) %>% 
+      cbind(actual = election.20copy$candidate) %>%
+      mutate(Correct = ifelse(candidate == "Swing", 
+                              ifelse(pred.winner == actual, "Yes", "No"),
+                              "Non")) %>% subset(select = -c(all.pred, candidate, pred.winner, actual))
+    
+    swingmap = left_join(mutate(counties, county = subregion), swing.tf)
+    
+    ggplot(data = swingmap) + 
+      geom_polygon(aes(x = long, y = lat, fill = as.factor(Correct), group = group),
+                   color = "white", size = 0.0001) + 
+      coord_fixed(1.3) + labs(title = "Predicted Swing Counties (Logistic Regression)", x = "Longitude", y = "Latitude", fill = "Winner") + 
+      guides(fill=FALSE) +
+      scale_fill_manual(values = c("Non" = "#7F7F7F", "Yes" = "green", "No" = "red"))
+    ```
+    
+    We repeat this process using the LASSO regularized logistic model. The LASSO model predicted 86 counties would be swing counties, and the error rate for predicted winners for those counties is 0.4302, which is lower than the error rate from logistic regression. The location of correct predictions are shown below in green and incorrect predictions in red:
+
+
+    ```{r problem 20.3}
+    set.seed(123)
+    # predict probabilites of winning on all counties
+    all.pred.1 = predict(election.lasso, as.matrix(election.cl[,-1]), type="response")
+    
+    # combine with all county data
+    election.20.1 = cbind(all.pred.1, election.meta[,c(1,3,4)], election.cl[,1])
+    election.20.1copy = election.20.1
+    
+    # change candidate to Swing if predicted prob between 47% and 53%
+    election.20.1$candidate = as.character(election.20.1$candidate)
+    election.20.1[between(election.20.1$s0, 0.47, 0.53), ]$candidate = "Swing"
+    
+    # select only counties predicted to be swing and find predicted winner
+    election.swing.1 = subset(election.20.1, election.20.1$candidate=="Swing") %>%
+      mutate(pred.winner = as.factor(ifelse(s0 <= 0.5, "Donald Trump", "Joe Biden")))
+    # how many are there?
+    # length(election.swing.1$county)
+    
+    # calculate error rate
+    swing.err.lasso = calc_error_rate(election.swing.1$pred.winner,
+                                election.20.1copy[between(election.20.1copy$s0, 0.47, 0.53), ]$candidate)
+    
+    # plot on map
+    swing.tf.1 =  election.20.1 %>% 
+      mutate(pred.winner = ifelse(candidate == "Swing", 
+                                  ifelse(s0 <= 0.5, "Donald Trump", "Joe Biden"), candidate)) %>% 
+      cbind(actual = election.20.1copy$candidate) %>%
+      mutate(Correct = ifelse(candidate == "Swing", 
+                              ifelse(pred.winner == actual, "Yes", "No"),
+                              "Non")) %>% subset(select = -c(s0, candidate, pred.winner, actual))
+    
+    swingmap.1 = left_join(mutate(counties, county = subregion), swing.tf.1)
+    
+    ggplot(data = swingmap.1) + 
+      geom_polygon(aes(x = long, y = lat, fill = as.factor(Correct), group = group),
+                   color = "white", size = 0.0001) + 
+      coord_fixed(1.3) + labs(title = "Predicted Swing Counties (LASSO Regression)", x = "Longitude", y = "Latitude", fill = "Winner") + 
+      guides(fill=FALSE) +
+      scale_fill_manual(values = c("Non" = "#7F7F7F", "Yes" = "green", "No" = "red"))
+    ```
+
+    We repeat this process using the LASSO regularized logistic model. The LASSO model predicted 193 counties would be swing counties, and the error rate for predicted winners for those counties is 0.5130, which is higher than the error rate from the LASSO model but lower than the error rate from logistic regression. The location of correct predictions are shown below in green and incorrect predictions in red:
+    
+    ```{r problem 20.5}
+    set.seed(123)
+    # predict probabilites of winning on all counties
+    all.pred.2 = predict(pruned.tree, election.cl, type="vector")[,2]
+    
+    # combine with all county data
+    election.20.2 = cbind(all.pred.2, election.meta[,c(1,3,4)], election.cl[,1])
+    election.20.2copy = election.20.2
+    
+    # change candidate to Swing if predicted prob between 47% and 53%
+    election.20.2$candidate = as.character(election.20.2$candidate)
+    election.20.2[between(election.20.2$all.pred.2, 0.47, 0.53), ]$candidate = "Swing"
+    
+    # select only counties predicted to be swing and find predicted winner
+    election.swing.2 = subset(election.20.2, election.20.2$candidate=="Swing") %>%
+      mutate(pred.winner = as.factor(ifelse(all.pred.2 <= 0.5, "Donald Trump", "Joe Biden")))
+    # how many are there?
+    # length(election.swing.2$county)
+    
+    # calculate error rate
+    swing.err.tree = calc_error_rate(election.swing.2$pred.winner,
+                                election.20.2copy[between(election.20.2copy$all.pred.2, 0.47, 0.53), ]$candidate)
+    
+    # plot on map
+    swing.tf.2 =  election.20.2 %>% 
+      mutate(pred.winner = ifelse(candidate == "Swing", 
+                                  ifelse(all.pred.2 <= 0.5, "Donald Trump", "Joe Biden"), candidate)) %>% 
+      cbind(actual = election.20.2copy$candidate) %>%
+      mutate(Correct = ifelse(candidate == "Swing", 
+                              ifelse(pred.winner == actual, "Yes", "No"),
+                              "Non")) %>% subset(select = -c(all.pred.2, candidate, pred.winner, actual))
+    
+    swingmap.2 = left_join(mutate(counties, county = subregion), swing.tf.2)
+    
+    ggplot(data = swingmap.2) + 
+      geom_polygon(aes(x = long, y = lat, fill = as.factor(Correct), group = group),
+                   color = "white", size = 0.0001) + 
+      coord_fixed(1.3) + labs(title = "Predicted Swing Counties (Decision Tree)", x = "Longitude", y = "Latitude", fill = "Winner") + 
+      guides(fill=FALSE) +
+      scale_fill_manual(values = c("Non" = "#7F7F7F", "Yes" = "green", "No" = "red"))
+    ```
+
+    We look at the variables to attempt to explain why these counties are swing counties. The densities of the variables based on the logistic regression model are plotted based on whether the county is predicted to be a swing county, vote for Joe Biden, or vote for Donald Trump. Some densities show little difference between the three, thus a couple of selected variables that do seem to show an interesting difference in their densities are shown below:
+
+    ```{r problem 20.4, fig.height=30, fig.width=10}
+    
+    election.20.eval = cbind(all.pred, election.cl[,-1]) %>%
+      mutate(candidate = "")
+    
+    election.20.eval[between(election.20.eval$all.pred, 0.47, 0.53), ]$candidate = "Swing"
+    election.20.eval[election.20.eval$all.pred > 0.53, ]$candidate = "Joe Biden"
+    election.20.eval[election.20.eval$all.pred < 0.47, ]$candidate = "Donald Trump"
+    
+    
+    election.20.plot = election.20.eval %>% mutate(candidate = as.factor(candidate)) %>%
+      pivot_longer(cols = c(Men, White, VotingAgeCitizen, Income, Poverty, Professional,
+                            Service, Office, Production, Drive, Carpool, Transit, OtherTransp,
+                            WorkAtHome, MeanCommute, Employed, PrivateWork, SelfEmployed, FamilyWork,
+                            Unemployment))
+    
+    # ggplot(data = election.20.plot, aes(x = value, y = after_stat(density), color = candidate)) +
+    #   geom_density(linewidth = 0.3) + labs(x = "Percentage", y = "Density") +
+    #   facet_wrap(~ name, ncol = 1, scales = "free") +
+    #   scale_color_manual(values = c("Donald Trump" = "red", "Joe Biden" = "blue", "Swing" = "purple"))
+    
+    # select interesting plots
+    election.20.sel = election.20.eval %>% mutate(candidate = as.factor(candidate)) %>%
+      pivot_longer(cols = c(Drive, Employed, Income, Office,
+                            Poverty, Production, Professional, SelfEmployed, VotingAgeCitizen, White))
+    
+    ggplot(data = election.20.sel, aes(x = value, y = after_stat(density), color = candidate)) +
+      geom_density(linewidth = 0.5) + labs(x = "Percentage", y = "Density") +
+      facet_wrap(~ name, ncol = 1, scales = "free") +
+      scale_color_manual(values = c("Donald Trump" = "#F8766D", "Joe Biden" = "#00BFC4", "Swing" = "purple"))
+    ```
+
+    As expected, the data from swing counties usually falls between the data from counties where Joe Biden won significantly and counties where Donald Trump won significantly. Sometimes, the swing county data has densities even greater than the densities of Biden counties and Trump counties, such as in `Drive` and `Office`. Some densities look extremely different between counties that voted for Biden and Trump. For example, Trump counties have on average lower percentages of people employed, more lower incomes, and much higher percentages of white people compared to Biden counties. 
+    
+    Of the 10 variables selected here, 5 of them are considered extremely significant in the logistic regression model: `White`, `VotingAgeCitizen`, `Professional`, `Production`, and `Employed`. Of those 5 variables, only 1 of them has a negative coefficient, `White`.
+
+<!-- 21. (Open ended) Interpret and discuss any overall insights gained in this analysis and possible explanations. Use any tools at your disposal to make your case: visualize errors on the map, discuss what does/doesn’t seems reasonable based on your understanding of these methods, propose possible directions (collecting additional data, domain knowledge, etc). -->
+
+21) All three models used to predict swing counties predicted that there would be far fewer swing counties than there were in reality. From the above analysis, we can say that swing counties are hard to predict because the values of some of the variables are more like Trump counties and some of the values of the variables are more like Biden counties. It appears that what field of work a voter is in also greatly affects who they will vote for, as those employed in the production field tend to vote for Trump and those employed in the professional fields tend to vote for Biden. Swing counties tend to be more similar to Trump counties in regards to `Production` but closer to Biden counties in regards to `Professional`; thus the calculated probabilities of who would win the county will fall somewhere in the middle. The stark difference between Trump counties and Biden counties in the graphical display of the `White` variable indicates that it is a key variable in predicting the response, and a high percentage of white people in a county means it is likelier that Donald Trump wins the county, provided all other variables remain the same.
+
+    The logistic regression model was used to provide an interpretation because the variables are easier to interpret as we assume linearity of the predictors. However, it is unreasonable to assume that data in the real world will be linear, so while the logistic regression model has the lowest test error rate of the 5 models we tried, it may not be the best model for new data. The census data is also from 2017, which may be outdated to use to predict election results in 2020. Using 2020 census data to predict election results may provide more accurate predictions for the information we want to know. Experts who have studied population demographics to predict election results may also have insight based on their prior knowledge on what type of model would provide the best predictions, including what kernels to specify in model fits and what range one should look at when considering different tuning parameters.
